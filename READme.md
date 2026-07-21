@@ -23,18 +23,6 @@ bookings real (persisted to SQLite) instead of simulated.
 - `/history` accepts an optional `phone_number` filter
 - New `/bookings` endpoint, same optional filter
 
-## ⚠️ Important: delete your old database file
-
-Your existing `whatsapp.db` was created with the old schema (no
-`phone_number` column). SQLite's `CREATE TABLE IF NOT EXISTS` won't
-retroactively add it. Before running the upgraded code:
-
-```bash
-rm whatsapp.db
-```
-
-It'll be recreated automatically on startup with the new schema.
-
 ## Setup
 
 ```bash
