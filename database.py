@@ -1,17 +1,12 @@
-"""
-database.py — upgraded with phone_number tracking + a bookings table.
 
-Changes from your original:
-- `messages` table now has a `phone_number` column, so each customer's
-  conversation is separate.
-- New `bookings` table so start_booking() can persist real bookings,
-  not just simulate them.
-- Added `created_at` timestamps for both tables.
-- get_all_messages() now supports an optional phone_number filter but
-  still returns everything if you don't pass one, so nothing breaks.
+"""
+database.py — adds a `customer_profiles` table for persistent customer
+memory (preferences, notes) that survives across separate conversations,
+on top of the existing per-message chat history and bookings.
 """
 
 import sqlite3
+import json
 
 DB_NAME = "whatsapp.db"
 
@@ -41,11 +36,21 @@ def init_db():
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS customer_profiles (
+            phone_number TEXT PRIMARY KEY,
+            name TEXT,
+            notes TEXT,
+            preferences TEXT,   -- stored as JSON text, e.g. {"event_type": "wedding"}
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     conn.commit()
     conn.close()
 
 
-# ---------- Messages ----------
+# ---------- Messages (unchanged) ----------
 
 def save_message(phone_number: str, user_message: str, bot_response: str):
     conn = sqlite3.connect(DB_NAME)
@@ -59,14 +64,10 @@ def save_message(phone_number: str, user_message: str, bot_response: str):
 
 
 def get_all_messages(phone_number: str | None = None):
-    """Returns all messages, or just one customer's if phone_number is given."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     if phone_number:
-        cursor.execute(
-            "SELECT * FROM messages WHERE phone_number = ? ORDER BY id",
-            (phone_number,),
-        )
+        cursor.execute("SELECT * FROM messages WHERE phone_number = ? ORDER BY id", (phone_number,))
     else:
         cursor.execute("SELECT * FROM messages ORDER BY id")
     rows = cursor.fetchall()
@@ -75,22 +76,18 @@ def get_all_messages(phone_number: str | None = None):
 
 
 def get_recent_messages(phone_number: str, limit: int = 10):
-    """Most recent N messages for one customer, oldest first — used to
-    build conversation history for Claude."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT * FROM messages
-        WHERE phone_number = ?
-        ORDER BY id DESC
-        LIMIT ?
+        SELECT * FROM messages WHERE phone_number = ?
+        ORDER BY id DESC LIMIT ?
     """, (phone_number, limit))
     rows = cursor.fetchall()
     conn.close()
     return list(reversed(rows))
 
 
-# ---------- Bookings ----------
+# ---------- Bookings (unchanged) ----------
 
 def create_booking(phone_number: str, preferred_date: str, preferred_time: str):
     conn = sqlite3.connect(DB_NAME)
@@ -109,12 +106,58 @@ def get_bookings(phone_number: str | None = None):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     if phone_number:
-        cursor.execute(
-            "SELECT * FROM bookings WHERE phone_number = ? ORDER BY id",
-            (phone_number,),
-        )
+        cursor.execute("SELECT * FROM bookings WHERE phone_number = ? ORDER BY id", (phone_number,))
     else:
         cursor.execute("SELECT * FROM bookings ORDER BY id")
     rows = cursor.fetchall()
     conn.close()
     return rows
+
+
+# ---------- Customer profiles (NEW — persistent memory) ----------
+
+def get_customer_profile(phone_number: str):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM customer_profiles WHERE phone_number = ?", (phone_number,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    _, name, notes, preferences_json, updated_at = row
+    return {
+        "phone_number": phone_number,
+        "name": name,
+        "notes": notes,
+        "preferences": json.loads(preferences_json) if preferences_json else {},
+        "updated_at": updated_at,
+    }
+
+
+def upsert_customer_profile(phone_number: str, name: str = None, notes: str = None, preferences: dict = None):
+    """Create or update a customer's profile. Only overwrites fields that
+    are actually passed in — existing values are preserved otherwise."""
+    existing = get_customer_profile(phone_number) or {}
+
+    final_name = name if name is not None else existing.get("name")
+    final_notes = notes if notes is not None else existing.get("notes")
+
+    final_preferences = existing.get("preferences", {}) or {}
+    if preferences:
+        final_preferences.update(preferences)
+
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO customer_profiles (phone_number, name, notes, preferences, updated_at)
+        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(phone_number) DO UPDATE SET
+            name = excluded.name,
+            notes = excluded.notes,
+            preferences = excluded.preferences,
+            updated_at = CURRENT_TIMESTAMP
+    """, (phone_number, final_name, final_notes, json.dumps(final_preferences)))
+    conn.commit()
+    conn.close()
+
+    return get_customer_profile(phone_number)
