@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from assistant import process_message
-from database import init_db, get_all_messages, get_bookings, save_message
+from database import init_db, get_all_messages, get_bookings, save_message, get_customer_profile
 
 app = FastAPI()
 
@@ -31,7 +31,6 @@ def message(phone_number: str, text: str):
 
 @app.get("/history")
 def history(phone_number: str | None = None):
-    # Optional phone_number filter; omit it to see every conversation
     data = get_all_messages(phone_number)
     return {
         "phone_number": phone_number,
@@ -47,4 +46,12 @@ def bookings(phone_number: str | None = None):
         "phone_number": phone_number,
         "total_bookings": len(data),
         "bookings": data,
+    }
+
+
+@app.get("/profile")
+def profile(phone_number: str):
+    return {
+        "phone_number": phone_number,
+        "profile": get_customer_profile(phone_number),
     }
