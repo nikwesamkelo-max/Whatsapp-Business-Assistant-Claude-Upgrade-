@@ -1,59 +1,60 @@
-# WhatsApp Business Assistant — Claude Upgrade (Phone Tracking + Real Bookings)
 
-Full upgrade of your repo: replaces the rule-based brain with Claude,
-tracks each customer's conversation separately by phone number, and makes
-bookings real (persisted to SQLite) instead of simulated.
+# WhatsApp Business Assistant — Customer Memory Upgrade
 
-## What changed, file by file
+Adds a `customer_profiles` table and two new tools so Claude remembers
+durable facts about each customer *across separate conversations*, not
+just within one chat.
 
-**`database.py`**
-- `messages` table now has a `phone_number` column + `created_at` timestamp
-- New `bookings` table (id, phone_number, preferred_date, preferred_time, status, created_at)
-- `get_all_messages(phone_number=None)` — filter by customer, or omit for everything
-- New `get_recent_messages(phone_number, limit)` — powers Claude's memory
-- New `create_booking()` / `get_bookings()`
+## How it relates to what you just read about Managed Agents
+
+Claude Platform's real "memory stores" work similarly in spirit — Claude
+reads a mounted file automatically at session start and writes to it when
+it learns something worth keeping. Here, we're doing the same idea with
+plain tool use on the standard Messages API:
+
+| Managed Agents memory store | This version |
+|---|---|
+| Mounted as files under `/mnt/memory/` | A `customer_profiles` row in SQLite |
+| Agent reads/writes with file tools automatically | Claude calls `update_customer_profile` explicitly |
+| Injected into context via the sandbox mount | Injected into the system prompt each request |
+
+When you get to the Managed Agents chapter, this is the concept you'll
+already understand — just with a different mechanism.
+
+## What changed
+
+**`database.py`** — new `customer_profiles` table (`phone_number`,
+`profile_json`, `updated_at`) with `get_customer_profile()` and
+`update_customer_profile(phone_number, key, value)`.
 
 **`assistant.py`**
-- `process_message(phone_number, message)` — now takes phone_number (signature change from before)
-- Pulls only *that customer's* history from SQLite, so conversations don't bleed into each other
-- `start_booking` tool now actually calls `database.create_booking()` and returns a real booking id
+- New `update_customer_profile` tool — Claude calls this when it learns
+  something durable (preferred event type, accessibility needs, etc.)
+- `_build_system_prompt()` now injects the customer's existing profile
+  into the system prompt on every request, so Claude "remembers" them
+  from the first message of a new conversation
+- System prompt tells Claude to use the profile naturally, not recite it
 
-**`main.py`**
-- `/message` now requires `phone_number` and `text` query params
-- `/history` accepts an optional `phone_number` filter
-- New `/bookings` endpoint, same optional filter
+**`main.py`** — new `GET /profile?phone_number=...` to inspect a
+customer's saved profile directly.
 
-## Setup
-
-```bash
-pip install -r requirements.txt
-export ANTHROPIC_API_KEY="sk-ant-..."
-uvicorn main:app --reload
-```
-
-## Test it — simulate two different customers
+## Test it — simulate a returning customer
 
 ```bash
-# Customer A
-curl "http://127.0.0.1:8000/message?phone_number=+15551111111&text=hi"
-curl "http://127.0.0.1:8000/message?phone_number=+15551111111&text=how%20much%20do%20you%20charge"
+# First conversation: customer mentions they always book weddings
+curl "http://127.0.0.1:8000/message?phone_number=+15551111111&text=hi%2C%20I%20run%20wedding%20events%20and%20always%20need%20round%20tables"
 
-# Customer B — separate conversation, won't see Customer A's history
-curl "http://127.0.0.1:8000/message?phone_number=+15552222222&text=what%20are%20your%20hours"
+# Check what got saved
+curl "http://127.0.0.1:8000/profile?phone_number=+15551111111"
 
-# Book an appointment
-curl "http://127.0.0.1:8000/message?phone_number=+15551111111&text=id%20like%20to%20book%20for%20next%20Friday%20at%203pm"
-
-# Check results
-curl "http://127.0.0.1:8000/history?phone_number=+15551111111"
-curl "http://127.0.0.1:8000/bookings"
+# New "session" - same customer, fresh conversation - notice it remembers
+curl "http://127.0.0.1:8000/message?phone_number=+15551111111&text=hi%20again%2C%20need%20a%20quote"
 ```
 
 ## Good next exercises
-- Add a `status` update tool so staff (or Claude) can mark bookings
-  "confirmed" / "cancelled"
-- Add real pricing data behind `get_price_info` (a `services` table)
-- Add prompt caching for `SYSTEM_PROMPT` once it grows
-- Add basic input validation on `phone_number` format
-- Add a `/bookings/{id}` endpoint to fetch or update a single booking
-- Swap `curl` testing for a simple `pytest` suite calling the endpoints
+- Add a `DELETE /profile` endpoint for GDPR-style "forget me" requests
+- Cap how much profile data gets injected into the prompt (summarize if
+  it grows large) — this is basically what Claude Platform's context
+  editing/compaction does automatically for Managed Agents
+- Add a `last_contacted` field and a tool to list customers who haven't
+  messaged in 30+ days, for follow-up campaigns
