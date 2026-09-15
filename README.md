@@ -1,68 +1,115 @@
-# WhatsApp Business Assistant — RAG Upgrade
+# WhatsApp Business Assistant — Claude API (Upgrades)
 
-Replaces the hardcoded `get_price_info`/`get_business_hours` stubs with
-real retrieval-augmented generation over a text knowledge base.
+A backend WhatsApp assistant for a small event rental business. Built
+progressively while working through Anthropic's Claude Platform courses -
+tool use, RAG, persistent memory, prompt caching, structured outputs,
+evals, and streaming.
 
-## Why pure-Python TF-IDF instead of a vector library
+## File structure
 
-Given you're on Termux, I deliberately avoided numpy/scikit-learn/
-sentence-transformers — those often fail to build on mobile ARM without
-precompiled wheels. `rag.py` implements TF-IDF + cosine similarity from
-scratch using only the standard library (`re`, `math`, `collections`).
-Nothing to compile, works anywhere Python runs.
+```
+whatsapp-course-upgrades/
+├── main.py               FastAPI app - all endpoints
+├── assistant.py           Claude "brain" - tool use, caching, streaming
+├── database.py             SQLite layer - messages, bookings, profiles, logs
+├── rag.py                   Retrieval engine (pure-Python TF-IDF, no ML deps)
+├── eval.py                   Behavioral regression tests
+├── requirements.txt            fastapi, uvicorn, anthropic
+├── .gitignore                    ignores whatsapp.db, .env, __pycache__
+└── knowledge/
+    ├── services.txt          business services + pricing
+    ├── hours_and_policies.txt  hours, deposits, cancellation, delivery
+    └── faq.txt                 common customer questions
+```
 
-It's the same underlying idea as embedding-based vector search (turn text
-into vectors, rank by similarity) — just using word-overlap statistics
-instead of a neural embedding model. For a small, well-scoped knowledge
-base like this, it works well and is honestly a better way to *learn*
-what retrieval is doing under the hood before you use a black-box library.
+Nothing here needs compiling - everything installs cleanly with plain
+`pip install`, built and tested on a phone (Termux).
 
-## What's new
+## What it does
 
-**`knowledge/`** — three text files, your actual business knowledge:
-- `services.txt` — what you offer and starting prices
-- `hours_and_policies.txt` — hours, deposits, cancellation, delivery area
-- `faq.txt` — common customer questions
+Customers message the assistant (simulated via query params for now,
+swap in a real WhatsApp webhook later) and it can:
+- Answer pricing/hours/policy/FAQ questions, grounded in real documents
+  via RAG - never guesses
+- Create bookings, tied to the customer's phone number
+- Remember customer preferences across separate conversations
+- Classify every interaction (category/sentiment/urgency) for analytics
 
-Edit these directly with your real business info — no code changes needed.
+## Architecture
 
-**`rag.py`** — loads and chunks the `.txt` files (split by paragraph),
-builds a TF-IDF index, and exposes `search_knowledge_base(query, top_k)`.
+```
+Customer message
+      |
+   FastAPI            <- main.py
+      |
+Claude assistant       <- assistant.py (tool-use loop)
+      |
+  -----------------------------
+  |            |               |
+Knowledge    Bookings      Customer
+base (RAG)   (SQLite)      memory (SQLite)
+  -----------------------------
+      |
+  Reply sent back
+```
 
-**`assistant.py`** — the old `get_price_info`/`get_business_hours` tools
-are gone, replaced by one `search_knowledge_base` tool. The system prompt
-now instructs Claude to always search before answering business questions,
-rather than guessing.
+## Upgrades, in the order they were built
 
-`database.py` and `main.py` are unchanged from your memory upgrade.
+1. **Tool use** — Claude calls real functions (search, book, remember)
+   instead of if/elif keyword matching.
+2. **RAG** — pricing/hours/policy answers come from `knowledge/*.txt` via
+   a hand-built TF-IDF + cosine similarity search (`rag.py`) - no vector
+   DB, no embeddings API, nothing that needs compiling on a phone.
+3. **Persistent memory** — `customer_profiles` table + an
+   `update_customer_profile` tool, so returning customers get continuity.
+4. **Prompt caching** — the static system prompt and tool definitions
+   carry `cache_control`, so repeat requests reuse the cached prefix
+   instead of reprocessing it every time.
+5. **Structured outputs** — a second, forced tool call
+   (`classify_interaction`) logs category/sentiment/urgency per message
+   into `interaction_logs`, decoupled so it never breaks a customer reply.
+6. **Eval pipeline** — `eval.py` checks real behavior, not keyword
+   matching: did the model call the right tool, with the right arguments,
+   and did the expected database row actually get created? See the
+   booking test for the clearest example of this.
+7. **Streaming** — `process_message_stream()` + `GET /message/stream`
+   yields the reply token-by-token.
 
-## Test it
+## Setup
 
 ```bash
 pip install -r requirements.txt
 export ANTHROPIC_API_KEY="sk-ant-..."
+rm -f whatsapp.db   # fresh schema on first run
 uvicorn main:app --reload
 ```
 
-```bash
-curl "http://127.0.0.1:8000/message?phone_number=+15551111111&text=do%20you%20handle%20outdoor%20weddings"
-curl "http://127.0.0.1:8000/message?phone_number=+15551111111&text=whats%20your%20cancellation%20policy"
-curl "http://127.0.0.1:8000/message?phone_number=+15551111111&text=do%20you%20do%20wheelchair%20accessible%20setups"
-```
+## Testing each piece
 
-You can also test the retrieval directly without the API:
 ```bash
-python3 -c "from rag import search_knowledge_base; print(search_knowledge_base('cancellation policy'))"
+# Basic message
+curl "http://127.0.0.1:8000/message?phone_number=+15551111111&text=do%20you%20handle%20outdoor%20weddings"
+
+# Streaming
+curl --no-buffer "http://127.0.0.1:8000/message/stream?phone_number=+15551111111&text=tell%20me%20about%20your%20tents"
+
+# Structured output analytics
+curl "http://127.0.0.1:8000/analytics"
+
+# Customer profile
+curl "http://127.0.0.1:8000/profile?phone_number=+15551111111"
+
+# Bookings
+curl "http://127.0.0.1:8000/bookings"
+
+# Full behavioral eval suite (uses real API - costs a few cents)
+python3 eval.py
 ```
 
 ## Good next exercises
-- Add a `/admin/reload-knowledge` endpoint that rebuilds the index without
-  restarting the server, so you can edit `knowledge/` files live
-- Add source attribution — have Claude mention which doc an answer came
-  from, useful for debugging
-- Once you're comfortable, swap `rag.py`'s TF-IDF for real embeddings
-  (e.g. Voyage AI, Anthropic's recommended embeddings partner) and
-  compare retrieval quality — a great before/after to talk about in
-  interviews
-- Chunk smarter: right now it splits on blank lines; try smaller/overlapping
-  chunks for longer documents
+- Batch/async the classify_interaction call so it doesn't add latency
+- Extend eval.py into a proper pytest suite with fixtures
+- Build a small dashboard from interaction_logs (counts by category)
+- Try multimodal: let a customer send a venue photo, still no heavy deps
+- Migrate to Claude Platform Managed Agents for production-grade,
+  resumable sessions (the natural next chapter)
