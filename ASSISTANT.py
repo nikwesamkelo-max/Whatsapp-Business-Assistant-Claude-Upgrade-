@@ -1,10 +1,18 @@
 """
-assistant.py — now answers pricing/hours/policy/FAQ questions via RAG
-(rag.py) instead of hardcoded stubs. Claude searches the knowledge base
-and answers from the retrieved text, rather than guessing.
+assistant.py — adds three upgrades on top of the RAG version:
 
-Keeps the customer memory (customer_profiles) and booking tools from the
-previous upgrade.
+1. Prompt caching: the static system prompt + tool definitions are marked
+   with cache_control, so repeat requests are cheaper and faster. Only the
+   per-customer profile (which changes) stays outside the cached block.
+
+2. Structured outputs: after replying, a second forced-tool-call classifies
+   the interaction (category/sentiment/urgency) into interaction_logs -
+   real analytics data, not free text you'd have to parse by hand.
+
+3. Streaming: process_message_stream() yields the reply token-by-token
+   using client.messages.stream(), for a more realistic chat feel.
+
+No new dependencies - same anthropic SDK you already have.
 """
 
 import json
@@ -28,10 +36,10 @@ answer, say you'll check with the team rather than inventing one.
 Help customers book by collecting a preferred date and time, then
 confirming with the start_booking tool.
 
-You have access to this customer's saved profile below. Use it naturally
-- don't recite it back like a report. When the customer shares something
-worth remembering for next time (a preference, event type, accessibility
-need), save it with update_customer_profile. Only save durable facts."""
+Use the customer's saved profile naturally - don't recite it back like a
+report. When the customer shares something worth remembering for next time
+(a preference, event type, accessibility need), save it with
+update_customer_profile. Only save durable facts."""
 
 
 def _make_tool_functions(phone_number: str):
@@ -60,6 +68,8 @@ def _make_tool_functions(phone_number: str):
         "update_customer_profile": update_customer_profile,
     }
 
+
+# ---------- Tools (cache_control on the LAST one caches this entire block) ----------
 
 TOOLS = [
     {
@@ -105,9 +115,60 @@ TOOLS = [
             },
             "required": ["key", "value"],
         },
+        "cache_control": {"type": "ephemeral"},  # caches this + everything above it
     },
 ]
 
+
+# ---------- Structured output tool (forced call, used for classification only) ----------
+
+CLASSIFY_TOOL = [
+    {
+        "name": "classify_interaction",
+        "description": "Classify this customer interaction for analytics purposes.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "category": {
+                    "type": "string",
+                    "enum": ["pricing_inquiry", "booking", "policy_question", "complaint", "general", "faq"],
+                },
+                "sentiment": {"type": "string", "enum": ["positive", "neutral", "negative"]},
+                "urgency": {"type": "string", "enum": ["low", "medium", "high"]},
+            },
+            "required": ["category", "sentiment", "urgency"],
+        },
+    }
+]
+
+
+def _classify_interaction(phone_number: str, user_message: str, bot_response: str):
+    """A second, separate API call that forces a structured classification
+    via tool_choice. Kept independent from the main conversation so a
+    classification hiccup never breaks the customer-facing reply."""
+    try:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=200,
+            tools=CLASSIFY_TOOL,
+            tool_choice={"type": "tool", "name": "classify_interaction"},
+            messages=[{
+                "role": "user",
+                "content": f"Customer said: {user_message!r}\nAssistant replied: {bot_response!r}",
+            }],
+        )
+        for block in response.content:
+            if block.type == "tool_use":
+                data = block.input
+                database.log_interaction(
+                    phone_number, data["category"], data["sentiment"], data["urgency"]
+                )
+    except Exception as e:
+        # Analytics should never take down the main assistant.
+        print(f"[classify_interaction] skipped due to error: {e}")
+
+
+# ---------- Shared helpers ----------
 
 def _build_history(phone_number: str):
     rows = database.get_recent_messages(phone_number, limit=10)
@@ -119,17 +180,40 @@ def _build_history(phone_number: str):
     return history
 
 
-def _build_system_prompt(phone_number: str) -> str:
+def _build_system_prompt(phone_number: str):
+    """Returns system as a list of blocks: the static instructions are
+    cached (cache_control), the per-customer profile is appended fresh
+    each time since it changes."""
     profile = database.get_customer_profile(phone_number)
     profile_text = json.dumps(profile, indent=2) if profile else "(no profile yet - new or unknown customer)"
-    return f"{BASE_SYSTEM_PROMPT}\n\nCustomer profile:\n{profile_text}"
+
+    return [
+        {
+            "type": "text",
+            "text": BASE_SYSTEM_PROMPT,
+            "cache_control": {"type": "ephemeral"},
+        },
+        {
+            "type": "text",
+            "text": f"Customer profile:\n{profile_text}",
+        },
+    ]
 
 
-def process_message(phone_number: str, message: str) -> str:
+# ---------- Non-streaming (unchanged behavior, now with caching + logging) ----------
+
+def _run_conversation(phone_number: str, message: str):
+    """Core loop, shared by process_message() and process_message_with_trace().
+    Returns (final_text, tool_calls) where tool_calls is a list of
+    {"name": ..., "input": ..., "result": ...} for every tool Claude
+    actually called - this is what makes real eval assertions possible,
+    instead of guessing from the reply text alone."""
     tool_functions = _make_tool_functions(phone_number)
     system_prompt = _build_system_prompt(phone_number)
     history = _build_history(phone_number)
     history.append({"role": "user", "content": message})
+
+    tool_calls = []
 
     while True:
         response = client.messages.create(
@@ -143,9 +227,75 @@ def process_message(phone_number: str, message: str) -> str:
         history.append({"role": "assistant", "content": response.content})
 
         if response.stop_reason != "tool_use":
-            return "".join(
+            final_text = "".join(
                 block.text for block in response.content if block.type == "text"
             )
+            database.save_message(phone_number, message, final_text)
+            _classify_interaction(phone_number, message, final_text)
+            return final_text, tool_calls
+
+        tool_results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                fn = tool_functions[block.name]
+                result = fn(**block.input)
+                tool_calls.append({"name": block.name, "input": block.input, "result": result})
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": json.dumps(result),
+                    }
+                )
+
+        history.append({"role": "user", "content": tool_results})
+
+
+def process_message(phone_number: str, message: str) -> str:
+    """Public entry point used by the API - same signature as before."""
+    final_text, _ = _run_conversation(phone_number, message)
+    return final_text
+
+
+def process_message_with_trace(phone_number: str, message: str):
+    """Like process_message, but also returns which tools were called and
+    with what arguments. Use this in eval.py - never rely on parsing the
+    reply text to infer what the model *did*."""
+    return _run_conversation(phone_number, message)
+
+
+# ---------- Streaming variant ----------
+
+def process_message_stream(phone_number: str, message: str):
+    """Generator that yields text chunks as they arrive. Tool calls happen
+    silently between chunks (nothing is yielded while a tool runs); only
+    the model's actual text output streams to the caller."""
+    tool_functions = _make_tool_functions(phone_number)
+    system_prompt = _build_system_prompt(phone_number)
+    history = _build_history(phone_number)
+    history.append({"role": "user", "content": message})
+
+    while True:
+        collected_text = []
+        with client.messages.stream(
+            model=MODEL,
+            max_tokens=512,
+            system=system_prompt,
+            tools=TOOLS,
+            messages=history,
+        ) as stream:
+            for chunk in stream.text_stream:
+                collected_text.append(chunk)
+                yield chunk
+            response = stream.get_final_message()
+
+        history.append({"role": "assistant", "content": response.content})
+
+        if response.stop_reason != "tool_use":
+            final_text = "".join(collected_text)
+            database.save_message(phone_number, message, final_text)
+            _classify_interaction(phone_number, message, final_text)
+            return
 
         tool_results = []
         for block in response.content:
