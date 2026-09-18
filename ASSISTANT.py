@@ -1,5 +1,5 @@
 """
-assistant.py — adds three upgrades on top of the RAG version:
+assistant.py — adds three course upgrades on top of the RAG version:
 
 1. Prompt caching: the static system prompt + tool definitions are marked
    with cache_control, so repeat requests are cheaper and faster. Only the
@@ -39,7 +39,12 @@ confirming with the start_booking tool.
 Use the customer's saved profile naturally - don't recite it back like a
 report. When the customer shares something worth remembering for next time
 (a preference, event type, accessibility need), save it with
-update_customer_profile. Only save durable facts."""
+update_customer_profile. Only save durable facts.
+
+If a customer sends a photo (e.g. of their venue), look at it and give
+practical advice - what setup would suit the space, whether it looks
+suitable for a tent, seating capacity it could hold, etc. Combine what
+you see with the knowledge base rather than guessing at business details."""
 
 
 def _make_tool_functions(phone_number: str):
@@ -202,16 +207,39 @@ def _build_system_prompt(phone_number: str):
 
 # ---------- Non-streaming (unchanged behavior, now with caching + logging) ----------
 
-def _run_conversation(phone_number: str, message: str):
+def _run_conversation(phone_number: str, message: str, image_base64: str = None, image_media_type: str = None):
     """Core loop, shared by process_message() and process_message_with_trace().
     Returns (final_text, tool_calls) where tool_calls is a list of
     {"name": ..., "input": ..., "result": ...} for every tool Claude
     actually called - this is what makes real eval assertions possible,
-    instead of guessing from the reply text alone."""
+    instead of guessing from the reply text alone.
+
+    If image_base64 is given, the message is sent as a multimodal turn
+    (image + text) - e.g. a customer sending a venue photo. No extra
+    dependencies needed; Claude does the actual image reasoning, we just
+    pass the bytes along."""
     tool_functions = _make_tool_functions(phone_number)
     system_prompt = _build_system_prompt(phone_number)
     history = _build_history(phone_number)
-    history.append({"role": "user", "content": message})
+
+    if image_base64:
+        user_content = [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": image_media_type or "image/jpeg",
+                    "data": image_base64,
+                },
+            },
+            {"type": "text", "text": message},
+        ]
+        logged_message = f"[image attached] {message}"
+    else:
+        user_content = message
+        logged_message = message
+
+    history.append({"role": "user", "content": user_content})
 
     tool_calls = []
 
@@ -230,8 +258,8 @@ def _run_conversation(phone_number: str, message: str):
             final_text = "".join(
                 block.text for block in response.content if block.type == "text"
             )
-            database.save_message(phone_number, message, final_text)
-            _classify_interaction(phone_number, message, final_text)
+            database.save_message(phone_number, logged_message, final_text)
+            _classify_interaction(phone_number, logged_message, final_text)
             return final_text, tool_calls
 
         tool_results = []
@@ -251,9 +279,10 @@ def _run_conversation(phone_number: str, message: str):
         history.append({"role": "user", "content": tool_results})
 
 
-def process_message(phone_number: str, message: str) -> str:
-    """Public entry point used by the API - same signature as before."""
-    final_text, _ = _run_conversation(phone_number, message)
+def process_message(phone_number: str, message: str, image_base64: str = None, image_media_type: str = None) -> str:
+    """Public entry point used by the API - same signature as before, plus
+    optional image_base64/image_media_type for multimodal messages."""
+    final_text, _ = _run_conversation(phone_number, message, image_base64, image_media_type)
     return final_text
 
 
