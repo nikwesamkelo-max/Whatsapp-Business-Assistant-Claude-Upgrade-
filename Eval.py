@@ -1,20 +1,20 @@
 """
 eval.py — behavioral tests for the assistant, not just keyword matching.
 
-The previous version only checked "does the reply text contain word X?" —
+The previous version only checked "does the reply text contain word X?" -
 that can pass even if the model never called a tool and just guessed, or
 fail on a perfectly good reply phrased differently. This version checks
 what the model actually DID: which tools it called, with what arguments,
 and whether the expected side effects (like a real booking row) exist in
-the database — plus a light text check as one signal among several, not
+the database - plus a light text check as one signal among several, not
 the only one.
 
 Uses assistant.process_message_with_trace(), which returns
-(final_text, tool_calls) — tool_calls is a list of
+(final_text, tool_calls) - tool_calls is a list of
 {"name": ..., "input": ..., "result": ...} for every tool the model
 actually invoked during the conversation.
 
-Note: calls the real API for every test case — costs a few cents per
+Note: calls the real API for every test case - costs a few cents per
 run, don't loop it constantly.
 
 Usage:
